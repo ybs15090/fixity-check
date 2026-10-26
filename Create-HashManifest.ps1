@@ -57,7 +57,7 @@ function Get-ArchiveRoot {
     return [IO.Path]::TrimEndingDirectorySeparator($full)
 }
 
-function Get-DefaultManifestPath {
+function Get-ArchiveDisplayName {
     param([string]$Root)
     $archiveName = [IO.Path]::GetFileName($Root)
     if ([string]::IsNullOrWhiteSpace($archiveName)) { $archiveName = 'Archive' }
@@ -65,7 +65,20 @@ function Get-DefaultManifestPath {
     $archiveName = $archiveName.TrimEnd([char[]]@(' ', '.'))
     if ([string]::IsNullOrWhiteSpace($archiveName)) { $archiveName = 'Archive' }
     if ($archiveName.Length -gt 180) { $archiveName = $archiveName.Substring(0, 180) }
-    return [IO.Path]::Combine($script:ManagedHashDirectory, "SHA256_$archiveName.csv")
+    return $archiveName
+}
+
+function Get-ManifestFileName {
+    param([string]$Root)
+    $date = Get-Date -Format 'yyyyMMdd'
+    return '{0}_SHA256_{1}.csv' -f (Get-ArchiveDisplayName $Root), $date
+}
+
+function Get-DefaultManifestPath {
+    param([string]$Root)
+    $parent = [IO.Path]::GetDirectoryName($Root)
+    if ([string]::IsNullOrWhiteSpace($parent)) { $parent = $Root }
+    return [IO.Path]::Combine($parent, (Get-ManifestFileName $Root))
 }
 
 function Assert-ArchiveRootOutsideManagement {
@@ -314,10 +327,20 @@ try {
         }
     }
     $manifestPath = Get-FullFileSystemPath $Manifest
+    # Manifest 指定到目录一级也合法：在该目录下按默认命名规则自动创建 CSV。
+    $isDirectoryTarget = $false
+    if ([IO.Directory]::Exists($manifestPath)) {
+        $isDirectoryTarget = $true
+    }
+    elseif (-not [IO.File]::Exists($manifestPath) -and [IO.Path]::GetExtension($manifestPath) -ine '.csv') {
+        $isDirectoryTarget = $true
+    }
+    if ($isDirectoryTarget) {
+        $manifestPath = [IO.Path]::Combine($manifestPath, (Get-ManifestFileName $root))
+    }
     $manifestParent = [IO.Path]::GetDirectoryName($manifestPath)
-    if ($script:Comparer.Equals($manifestParent, $script:ManagedHashDirectory) -and
-        -not [IO.Directory]::Exists($script:ManagedHashDirectory)) {
-        $null = [IO.Directory]::CreateDirectory($script:ManagedHashDirectory)
+    if ($isDirectoryTarget -and -not [IO.Directory]::Exists($manifestParent)) {
+        $null = [IO.Directory]::CreateDirectory($manifestParent)
     }
     Assert-NewOutput $manifestPath $root
     Write-Host "Manifest：$manifestPath"
@@ -401,7 +424,8 @@ try {
     Write-Host "基准清单已保存：$manifestPath" -ForegroundColor Green
     Write-Host "总耗时：$($watch.Elapsed)"
     Write-Host '请立即独立校验，并将这份基准清单备份到不同设备。'
-    exit 0
+    # 用 return 结束脚本而非 exit，运行后回到交互式提示符，不关闭宿主会话。
+    return
 }
 catch {
     Write-Host "建立基准失败：$($_.Exception.GetBaseException().Message)" -ForegroundColor Red
@@ -409,7 +433,7 @@ catch {
         Write-Host "如已生成中间文件，将保留在：$stagingPath"
         Write-Host '该 .incomplete 文件不可用于验证，也不要手动改名为正式清单。'
     }
-    exit 2
+    return
 }
 finally {
     if ($writer) { $writer.Dispose() }

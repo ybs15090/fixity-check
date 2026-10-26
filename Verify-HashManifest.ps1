@@ -58,7 +58,7 @@ function Get-ArchiveRoot {
     return [IO.Path]::TrimEndingDirectorySeparator($full)
 }
 
-function Get-DefaultManifestPath {
+function Get-ArchiveDisplayName {
     param([string]$Root)
     $archiveName = [IO.Path]::GetFileName($Root)
     if ([string]::IsNullOrWhiteSpace($archiveName)) { $archiveName = 'Archive' }
@@ -66,7 +66,33 @@ function Get-DefaultManifestPath {
     $archiveName = $archiveName.TrimEnd([char[]]@(' ', '.'))
     if ([string]::IsNullOrWhiteSpace($archiveName)) { $archiveName = 'Archive' }
     if ($archiveName.Length -gt 180) { $archiveName = $archiveName.Substring(0, 180) }
-    return [IO.Path]::Combine($script:ManagedHashDirectory, "SHA256_$archiveName.csv")
+    return $archiveName
+}
+
+function Get-ManifestFileName {
+    param([string]$Root)
+    $date = Get-Date -Format 'yyyyMMdd'
+    return '{0}_SHA256_{1}.csv' -f (Get-ArchiveDisplayName $Root), $date
+}
+
+function Get-DefaultManifestPath {
+    param([string]$Root)
+    $parent = [IO.Path]::GetDirectoryName($Root)
+    if ([string]::IsNullOrWhiteSpace($parent)) { $parent = $Root }
+    return [IO.Path]::Combine($parent, (Get-ManifestFileName $Root))
+}
+
+function Find-DefaultManifest {
+    param([string]$Root)
+    $parent = [IO.Path]::GetDirectoryName($Root)
+    if ([string]::IsNullOrWhiteSpace($parent)) { $parent = $Root }
+    $pattern = '{0}_SHA256_*.csv' -f (Get-ArchiveDisplayName $Root)
+    $matches = @([IO.Directory]::GetFiles($parent, $pattern))
+    if ($matches.Count -eq 0) {
+        throw "在 $parent 未找到匹配 $pattern 的基准清单，请显式指定 -Manifest。"
+    }
+    $latest = $matches | Sort-Object { [IO.File]::GetLastWriteTimeUtc($_) } -Descending | Select-Object -First 1
+    return $latest
 }
 
 function Assert-ArchiveRootOutsideManagement {
@@ -365,14 +391,13 @@ try {
     if ([string]::IsNullOrWhiteSpace($Path)) { throw '缺少 Path：请指定归档根目录。' }
     $root = Get-ArchiveRoot $Path
     Assert-ArchiveRootOutsideManagement $root
-    $defaultManifest = Get-DefaultManifestPath $root
     if ([string]::IsNullOrWhiteSpace($Manifest)) {
         if ($Interactive) {
-            $answer = Read-Host "请输入 Manifest（直接回车使用 $defaultManifest）"
-            $Manifest = if ([string]::IsNullOrWhiteSpace($answer)) { $defaultManifest } else { $answer }
+            $answer = Read-Host '请输入 Manifest（直接回车自动在 Path 同级目录查找 <路径名>_SHA256_*.csv）'
+            if (-not [string]::IsNullOrWhiteSpace($answer)) { $Manifest = $answer }
         }
-        else {
-            $Manifest = $defaultManifest
+        if ([string]::IsNullOrWhiteSpace($Manifest)) {
+            $Manifest = Find-DefaultManifest $root
         }
     }
     $manifestPath = Get-FullFileSystemPath $Manifest
@@ -524,14 +549,14 @@ try {
     Write-Host "报告保存位置：$reportPath"
     if ($abnormalFiles -eq 0 -and $readErrors -eq 0) {
         Write-Host '完整性校验通过：所有基准文件 SHA-256 均一致，且未发现缺失文件或异常文件。' -ForegroundColor Green
-        exit 0
+        # 用 return 结束脚本而非 exit，运行后回到交互式提示符，不关闭宿主会话。
+        return
     }
     Write-Host '完整性校验未通过。' -ForegroundColor Red
     Write-Host "异常文件 $abnormalFiles 个，另有扫描错误事件 $($counts['SCAN_ERROR']) 个。" -ForegroundColor Red
     if ($counts['SCAN_ERROR'] -gt 0) { Write-Host '扫描不完整，异常文件总数可能更多。' }
     Write-Host '不要立即覆盖其他备份副本，应先使用其他独立副本进行交叉验证。' -ForegroundColor Yellow
-    if ($readErrors -gt 0) { exit 2 }
-    exit 1
+    return
 }
 catch {
     Write-Host "校验任务失败：$($_.Exception.GetBaseException().Message)" -ForegroundColor Red
@@ -540,7 +565,7 @@ catch {
         Write-Host "如已生成中间报告，将保留在：$stagingPath"
         Write-Host '该文件为未完成报告，不代表完整校验结果。'
     }
-    exit 2
+    return
 }
 finally {
     if ($writer) { $writer.Dispose() }
