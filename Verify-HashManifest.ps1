@@ -312,6 +312,17 @@ function Write-CsvRecord {
     $Writer.WriteLine($escaped -join ',')
 }
 
+function Test-ContinueRun {
+    param([string]$Prompt)
+    # 非交互调用只执行一轮；交互模式默认继续，输入 N（或 no/否）退出。
+    if (-not $Interactive) { return $false }
+    Write-Host ''
+    $answer = Read-Host $Prompt
+    # 输入流已结束（如重定向文件读完）时不再继续，避免反复空提示。
+    if ($null -eq $answer) { return $false }
+    return ($answer -notmatch '^\s*(?:n|no|否)\s*$')
+}
+
 function Read-ValidatedManifest {
     param([IO.Stream]$Stream)
     $parser = $null
@@ -371,205 +382,227 @@ function Read-ValidatedManifest {
     }
 }
 
-$watch = [Diagnostics.Stopwatch]::StartNew()
-$manifestStream = $null
-$outputStream = $null
-$writer = $null
-$stagingPath = $null
-$published = $false
-try {
-    if (-not $IsWindows) { throw '本脚本面向 Windows + PowerShell 7。' }
-    if ($Interactive) {
-        Write-Host 'Path：当前要检查的归档副本根目录。'
-        Write-Host 'Manifest：首次归档时建立的 SHA-256 基准 CSV；仅只读使用。'
-        Write-Host 'Report：本次新报告的 CSV 完整路径；留空时自动生成。'
-        Write-Host '路径不要加引号'
-        if ([string]::IsNullOrWhiteSpace($Path)) {
-            $Path = Read-Host '请输入 Path'
-        }
-    }
-    if ([string]::IsNullOrWhiteSpace($Path)) { throw '缺少 Path：请指定归档根目录。' }
-    $root = Get-ArchiveRoot $Path
-    Assert-ArchiveRootOutsideManagement $root
-    if ([string]::IsNullOrWhiteSpace($Manifest)) {
-        if ($Interactive) {
-            $answer = Read-Host '请输入 Manifest（直接回车自动在 Path 同级目录查找 <路径名>_SHA256_*.csv）'
-            if (-not [string]::IsNullOrWhiteSpace($answer)) { $Manifest = $answer }
-        }
-        if ([string]::IsNullOrWhiteSpace($Manifest)) {
-            $Manifest = Find-DefaultManifest $root
-        }
-    }
-    $manifestPath = Get-FullFileSystemPath $Manifest
-    if ($Interactive -and [string]::IsNullOrWhiteSpace($Report)) {
-        $answer = Read-Host '请输入 Report（直接回车自动生成）'
-        if (-not [string]::IsNullOrWhiteSpace($answer)) { $Report = $answer }
-    }
-    Write-Host "Manifest：$manifestPath"
-    if ($script:Comparer.Equals($root, $PSScriptRoot)) {
-        Write-Warning 'Path 是脚本目录：脚本、BAT、说明文件及其他普通文件也会被检查；HASH 管理目录除外。'
-    }
-    if ([IO.Path]::GetExtension($manifestPath) -ine '.csv') {
-        throw '只接受正式 .csv 清单，不接受 .incomplete 文件。'
-    }
-    Assert-NoReparsePoint $manifestPath
-    # 整个验证过程保持清单只读打开；不赋予写入权限，不调用任何更新清单的接口。
-    $manifestStream = [IO.FileStream]::new($manifestPath, [IO.FileMode]::Open,
-        [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    $baseline = (Read-ValidatedManifest $manifestStream).Entries
-    if (Test-IsInsideArchive $manifestPath $root) {
-        $manifestRelative = [IO.Path]::GetRelativePath($root, $manifestPath)
-        if ($baseline.ContainsKey($manifestRelative)) {
-            throw 'Manifest 把自身列为归档文件，拒绝循环校验。'
-        }
-    }
-    if (-not [string]::IsNullOrWhiteSpace($Report)) {
-        $reportPath = Get-FullFileSystemPath $Report
-    }
-    else {
-        $name = 'Verification_{0}_{1}.csv' -f (Get-Date -Format 'yyyy-MM-dd_HHmmss_fff'), ([guid]::NewGuid().ToString('N').Substring(0, 8))
-        $reportPath = [IO.Path]::Combine([IO.Path]::GetDirectoryName($manifestPath), $name)
-    }
-    if ($script:Comparer.Equals($reportPath, $manifestPath)) { throw '报告路径不能与原始 Manifest 相同。' }
-    if (Test-IsInsideArchive $reportPath $root) {
-        $reportRelative = [IO.Path]::GetRelativePath($root, $reportPath)
-        if ($baseline.ContainsKey($reportRelative)) {
-            throw "报告路径与基准文件条目冲突：$reportRelative"
-        }
-    }
-    Assert-NewOutput $reportPath $root
-    Write-Host "归档根目录：$root"
-    Write-Host "只读基准清单：$manifestPath"
-    Write-Host '请保持归档静止；大小不符的文件也将完整计算 SHA-256。'
-    $inventory = Get-ArchiveInventory $root $manifestPath $null
+# 交互循环的每轮输入；第一轮沿用命令行参数，继续执行时由提示重新提供。
+[string]$inputPath = $Path
+[string]$inputManifest = $Manifest
+[string]$inputReport = $Report
 
-    $stagingPath = $reportPath + '.' + [guid]::NewGuid().ToString('N') + '.incomplete'
-    $outputStream = [IO.FileStream]::new($stagingPath, [IO.FileMode]::CreateNew,
-        [IO.FileAccess]::Write, [IO.FileShare]::None)
-    $writer = [IO.StreamWriter]::new($outputStream, [Text.UTF8Encoding]::new($true), 65536, $true)
-    Write-CsvRecord $writer @('RelativePath', 'Status', 'ExpectedSize', 'ActualSize',
-        'ExpectedSHA256', 'ActualSHA256', 'ExpectedLastWriteTimeUtc',
-        'ActualLastWriteTimeUtc', 'ErrorMessage', 'ReportMarker')
-    $counts = [ordered]@{
-        OK = 0; MISSING = 0; SIZE_MISMATCH = 0; HASH_MISMATCH = 0
-        NEW_FILE = 0; READ_ERROR = 0; FILE_CHANGED_DURING_HASH = 0; SCAN_ERROR = 0
-    }
-    [int]$processed = 0
-    [long]$verifiedBytes = 0
-    foreach ($relative in ($baseline.Keys | Sort-Object)) {
-        $processed++
-        $expected = $baseline[$relative]
-        $fullPath = [IO.Path]::Combine($root, $relative)
-        $actualSize = $null
-        $actualHash = ''
-        $writeTime = ''
-        $message = ''
-        $status = ''
-        Write-Progress -Id 1 -Activity '验证 SHA-256 基准' -Status "$processed / $($baseline.Count)；$relative" -PercentComplete (100.0 * $processed / $baseline.Count)
-        try {
-            Assert-NoReparsePoint $fullPath
-            if ([IO.File]::GetAttributes($fullPath) -band [IO.FileAttributes]::Directory) {
-                throw '基准文件所在位置现在是目录。'
-            }
-            $actualSize = [IO.FileInfo]::new($fullPath).Length
-            $result = Get-StreamingSHA256 $fullPath $relative
-            $actualSize = $result.Size
-            $actualHash = $result.SHA256
-            $writeTime = $result.LastWriteTimeUtc
-            $verifiedBytes += $result.Size
-            # 大小不符优先标记 SIZE_MISMATCH，但保留实际 SHA-256 供跨副本比对。
-            if ($actualSize -ne $expected.Size) {
-                $status = 'SIZE_MISMATCH'
-            }
-            elseif ($actualHash -ne $expected.SHA256) {
-                $status = 'HASH_MISMATCH'
-            }
-            else {
-                $status = 'OK'
-            }
-        }
-        catch {
-            $cause = $_.Exception.GetBaseException()
-            if ($cause.Message.StartsWith('FILE_CHANGED_DURING_HASH:', [StringComparison]::Ordinal)) {
-                $status = 'FILE_CHANGED_DURING_HASH'
-            }
-            elseif ($cause -is [IO.FileNotFoundException] -or $cause -is [IO.DirectoryNotFoundException]) {
-                $status = 'MISSING'
-            }
-            else {
-                $status = 'READ_ERROR'
-            }
-            $message = $cause.Message
-        }
-        $counts[$status]++
-        Write-CsvRecord $writer @($relative, $status, $expected.Size, $actualSize,
-            $expected.SHA256, $actualHash, $expected.LastWriteTimeUtc,
-            $writeTime, $message, $script:ReportMarker)
-        if ($status -ne 'OK') { Write-Warning "[$status] $relative $message" }
-    }
-    Write-Progress -Id 1 -Activity '验证 SHA-256 基准' -Completed
-
-    # NEW_FILE 没有基准可供比较，记录大小和时间，不额外读取内容计算哈希。
-    foreach ($relative in ($inventory.Files.Keys | Sort-Object)) {
-        if (-not $baseline.ContainsKey($relative)) {
-            $item = $inventory.Files[$relative]
-            $counts['NEW_FILE']++
-            Write-CsvRecord $writer @($relative, 'NEW_FILE', $null, $item.Size, '', '',
-                '', $item.LastWriteTimeUtc.ToString('o', [Globalization.CultureInfo]::InvariantCulture),
-                '', $script:ReportMarker)
-            Write-Warning "[NEW_FILE] $relative"
-        }
-    }
-    foreach ($issue in $inventory.Issues) {
-        $counts['SCAN_ERROR']++
-        Write-CsvRecord $writer @($issue.RelativePath, 'SCAN_ERROR', $null, $null, '', '',
-            '', '', $issue.ErrorMessage, $script:ReportMarker)
-    }
-
-    $writer.Flush()
-    $outputStream.Flush($true)
-    $writer.Dispose()
-    $writer = $null
-    $outputStream.Dispose()
+# 交互模式（双击 BAT）下循环执行；非交互调用执行一轮后结束。
+# 每轮重新初始化输出状态，避免上一轮的中间文件信息混入下一轮。
+while ($true) {
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $manifestStream = $null
     $outputStream = $null
-    Assert-NewOutput $reportPath $root
-    [IO.File]::Move($stagingPath, $reportPath, $false)
-    $published = $true
-    $watch.Stop()
-    $abnormalFiles = $baseline.Count - $counts['OK'] + $counts['NEW_FILE']
-    $readErrors = $counts['READ_ERROR'] + $counts['FILE_CHANGED_DURING_HASH'] + $counts['SCAN_ERROR']
-    $totalFiles = $baseline.Count + $counts['NEW_FILE']
-    Write-Host ''
-    Write-Host "总文件数（基准 + 新文件）：$totalFiles；基准文件：$($baseline.Count)；当前实际普通文件：$($inventory.Files.Count)"
-    foreach ($statusName in $counts.Keys) { Write-Host ("{0}: {1}" -f $statusName, $counts[$statusName]) }
-    Write-Host "读取/计算/扫描错误：$readErrors（SCAN_ERROR 是扫描错误事件，可能与文件错误重叠）"
-    Write-Host "已校验数据总量：$verifiedBytes 字节（$([Math]::Round($verifiedBytes / 1GB, 3)) GiB）"
-    Write-Host "排除的清单/报告：$($inventory.Skipped.Count)"
-    Write-Host "校验耗时：$($watch.Elapsed)"
-    Write-Host "报告保存位置：$reportPath"
-    if ($abnormalFiles -eq 0 -and $readErrors -eq 0) {
-        Write-Host '完整性校验通过：所有基准文件 SHA-256 均一致，且未发现缺失文件或异常文件。' -ForegroundColor Green
-        # 用 return 结束脚本而非 exit，运行后回到交互式提示符，不关闭宿主会话。
+    $writer = $null
+    $stagingPath = $null
+    $published = $false
+    try {
+        if (-not $IsWindows) { throw '本脚本面向 Windows + PowerShell 7。' }
+        if ($Interactive) {
+            Write-Host 'Path：当前要检查的归档副本根目录。'
+            Write-Host 'Manifest：首次归档时建立的 SHA-256 基准 CSV；仅只读使用。'
+            Write-Host 'Report：本次新报告的 CSV 完整路径；留空时自动生成。'
+            Write-Host '路径不要加引号'
+            if ([string]::IsNullOrWhiteSpace($inputPath)) {
+                $inputPath = Read-Host '请输入 Path'
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($inputPath)) { throw '缺少 Path：请指定归档根目录。' }
+        $root = Get-ArchiveRoot $inputPath
+        Assert-ArchiveRootOutsideManagement $root
+        if ([string]::IsNullOrWhiteSpace($inputManifest)) {
+            if ($Interactive) {
+                $answer = Read-Host '请输入 Manifest（直接回车自动在 Path 同级目录查找 <路径名>_SHA256_*.csv）'
+                if (-not [string]::IsNullOrWhiteSpace($answer)) { $inputManifest = $answer }
+            }
+            if ([string]::IsNullOrWhiteSpace($inputManifest)) {
+                $inputManifest = Find-DefaultManifest $root
+            }
+        }
+        $manifestPath = Get-FullFileSystemPath $inputManifest
+        if ($Interactive -and [string]::IsNullOrWhiteSpace($inputReport)) {
+            $answer = Read-Host '请输入 Report（直接回车自动生成）'
+            if (-not [string]::IsNullOrWhiteSpace($answer)) { $inputReport = $answer }
+        }
+        Write-Host "Manifest：$manifestPath"
+        if ($script:Comparer.Equals($root, $PSScriptRoot)) {
+            Write-Warning 'Path 是脚本目录：脚本、BAT、说明文件及其他普通文件也会被检查；HASH 管理目录除外。'
+        }
+        if ([IO.Path]::GetExtension($manifestPath) -ine '.csv') {
+            throw '只接受正式 .csv 清单，不接受 .incomplete 文件。'
+        }
+        Assert-NoReparsePoint $manifestPath
+        # 整个验证过程保持清单只读打开；不赋予写入权限，不调用任何更新清单的接口。
+        $manifestStream = [IO.FileStream]::new($manifestPath, [IO.FileMode]::Open,
+            [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        $baseline = (Read-ValidatedManifest $manifestStream).Entries
+        if (Test-IsInsideArchive $manifestPath $root) {
+            $manifestRelative = [IO.Path]::GetRelativePath($root, $manifestPath)
+            if ($baseline.ContainsKey($manifestRelative)) {
+                throw 'Manifest 把自身列为归档文件，拒绝循环校验。'
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($inputReport)) {
+            $reportPath = Get-FullFileSystemPath $inputReport
+        }
+        else {
+            $name = 'Verification_{0}_{1}.csv' -f (Get-Date -Format 'yyyy-MM-dd_HHmmss_fff'), ([guid]::NewGuid().ToString('N').Substring(0, 8))
+            $reportPath = [IO.Path]::Combine([IO.Path]::GetDirectoryName($manifestPath), $name)
+        }
+        if ($script:Comparer.Equals($reportPath, $manifestPath)) { throw '报告路径不能与原始 Manifest 相同。' }
+        if (Test-IsInsideArchive $reportPath $root) {
+            $reportRelative = [IO.Path]::GetRelativePath($root, $reportPath)
+            if ($baseline.ContainsKey($reportRelative)) {
+                throw "报告路径与基准文件条目冲突：$reportRelative"
+            }
+        }
+        Assert-NewOutput $reportPath $root
+        Write-Host "归档根目录：$root"
+        Write-Host "只读基准清单：$manifestPath"
+        Write-Host '请保持归档静止；大小不符的文件也将完整计算 SHA-256。'
+        $inventory = Get-ArchiveInventory $root $manifestPath $null
+
+        $stagingPath = $reportPath + '.' + [guid]::NewGuid().ToString('N') + '.incomplete'
+        $outputStream = [IO.FileStream]::new($stagingPath, [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $writer = [IO.StreamWriter]::new($outputStream, [Text.UTF8Encoding]::new($true), 65536, $true)
+        Write-CsvRecord $writer @('RelativePath', 'Status', 'ExpectedSize', 'ActualSize',
+            'ExpectedSHA256', 'ActualSHA256', 'ExpectedLastWriteTimeUtc',
+            'ActualLastWriteTimeUtc', 'ErrorMessage', 'ReportMarker')
+        $counts = [ordered]@{
+            OK = 0; MISSING = 0; SIZE_MISMATCH = 0; HASH_MISMATCH = 0
+            NEW_FILE = 0; READ_ERROR = 0; FILE_CHANGED_DURING_HASH = 0; SCAN_ERROR = 0
+        }
+        [int]$processed = 0
+        [long]$verifiedBytes = 0
+        foreach ($relative in ($baseline.Keys | Sort-Object)) {
+            $processed++
+            $expected = $baseline[$relative]
+            $fullPath = [IO.Path]::Combine($root, $relative)
+            $actualSize = $null
+            $actualHash = ''
+            $writeTime = ''
+            $message = ''
+            $status = ''
+            Write-Progress -Id 1 -Activity '验证 SHA-256 基准' -Status "$processed / $($baseline.Count)；$relative" -PercentComplete (100.0 * $processed / $baseline.Count)
+            try {
+                Assert-NoReparsePoint $fullPath
+                if ([IO.File]::GetAttributes($fullPath) -band [IO.FileAttributes]::Directory) {
+                    throw '基准文件所在位置现在是目录。'
+                }
+                $actualSize = [IO.FileInfo]::new($fullPath).Length
+                $result = Get-StreamingSHA256 $fullPath $relative
+                $actualSize = $result.Size
+                $actualHash = $result.SHA256
+                $writeTime = $result.LastWriteTimeUtc
+                $verifiedBytes += $result.Size
+                # 大小不符优先标记 SIZE_MISMATCH，但保留实际 SHA-256 供跨副本比对。
+                if ($actualSize -ne $expected.Size) {
+                    $status = 'SIZE_MISMATCH'
+                }
+                elseif ($actualHash -ne $expected.SHA256) {
+                    $status = 'HASH_MISMATCH'
+                }
+                else {
+                    $status = 'OK'
+                }
+            }
+            catch {
+                $cause = $_.Exception.GetBaseException()
+                if ($cause.Message.StartsWith('FILE_CHANGED_DURING_HASH:', [StringComparison]::Ordinal)) {
+                    $status = 'FILE_CHANGED_DURING_HASH'
+                }
+                elseif ($cause -is [IO.FileNotFoundException] -or $cause -is [IO.DirectoryNotFoundException]) {
+                    $status = 'MISSING'
+                }
+                else {
+                    $status = 'READ_ERROR'
+                }
+                $message = $cause.Message
+            }
+            $counts[$status]++
+            Write-CsvRecord $writer @($relative, $status, $expected.Size, $actualSize,
+                $expected.SHA256, $actualHash, $expected.LastWriteTimeUtc,
+                $writeTime, $message, $script:ReportMarker)
+            if ($status -ne 'OK') { Write-Warning "[$status] $relative $message" }
+        }
+        Write-Progress -Id 1 -Activity '验证 SHA-256 基准' -Completed
+
+        # NEW_FILE 没有基准可供比较，记录大小和时间，不额外读取内容计算哈希。
+        foreach ($relative in ($inventory.Files.Keys | Sort-Object)) {
+            if (-not $baseline.ContainsKey($relative)) {
+                $item = $inventory.Files[$relative]
+                $counts['NEW_FILE']++
+                Write-CsvRecord $writer @($relative, 'NEW_FILE', $null, $item.Size, '', '',
+                    '', $item.LastWriteTimeUtc.ToString('o', [Globalization.CultureInfo]::InvariantCulture),
+                    '', $script:ReportMarker)
+                Write-Warning "[NEW_FILE] $relative"
+            }
+        }
+        foreach ($issue in $inventory.Issues) {
+            $counts['SCAN_ERROR']++
+            Write-CsvRecord $writer @($issue.RelativePath, 'SCAN_ERROR', $null, $null, '', '',
+                '', '', $issue.ErrorMessage, $script:ReportMarker)
+        }
+
+        $writer.Flush()
+        $outputStream.Flush($true)
+        $writer.Dispose()
+        $writer = $null
+        $outputStream.Dispose()
+        $outputStream = $null
+        Assert-NewOutput $reportPath $root
+        [IO.File]::Move($stagingPath, $reportPath, $false)
+        $published = $true
+        $watch.Stop()
+        $abnormalFiles = $baseline.Count - $counts['OK'] + $counts['NEW_FILE']
+        $readErrors = $counts['READ_ERROR'] + $counts['FILE_CHANGED_DURING_HASH'] + $counts['SCAN_ERROR']
+        $totalFiles = $baseline.Count + $counts['NEW_FILE']
+        Write-Host ''
+        Write-Host "总文件数（基准 + 新文件）：$totalFiles；基准文件：$($baseline.Count)；当前实际普通文件：$($inventory.Files.Count)"
+        foreach ($statusName in $counts.Keys) { Write-Host ("{0}: {1}" -f $statusName, $counts[$statusName]) }
+        Write-Host "读取/计算/扫描错误：$readErrors（SCAN_ERROR 是扫描错误事件，可能与文件错误重叠）"
+        Write-Host "已校验数据总量：$verifiedBytes 字节（$([Math]::Round($verifiedBytes / 1GB, 3)) GiB）"
+        Write-Host "排除的清单/报告：$($inventory.Skipped.Count)"
+        Write-Host "校验耗时：$($watch.Elapsed)"
+        Write-Host "报告保存位置：$reportPath"
+        if ($abnormalFiles -eq 0 -and $readErrors -eq 0) {
+            Write-Host '完整性校验通过：所有基准文件 SHA-256 均一致，且未发现缺失文件或异常文件。' -ForegroundColor Green
+        }
+        else {
+            Write-Host '完整性校验未通过。' -ForegroundColor Red
+            Write-Host "异常文件 $abnormalFiles 个，另有扫描错误事件 $($counts['SCAN_ERROR']) 个。" -ForegroundColor Red
+            if ($counts['SCAN_ERROR'] -gt 0) { Write-Host '扫描不完整，异常文件总数可能更多。' }
+            Write-Host '不要立即覆盖其他备份副本，应先使用其他独立副本进行交叉验证。' -ForegroundColor Yellow
+        }
+        # 交互模式默认继续；非交互调用或用户输入 N 时结束脚本。
+        if (Test-ContinueRun '按回车继续校验下一份副本，输入 N 退出') {
+            $inputPath = ''
+            $inputManifest = ''
+            $inputReport = ''
+            continue
+        }
         return
     }
-    Write-Host '完整性校验未通过。' -ForegroundColor Red
-    Write-Host "异常文件 $abnormalFiles 个，另有扫描错误事件 $($counts['SCAN_ERROR']) 个。" -ForegroundColor Red
-    if ($counts['SCAN_ERROR'] -gt 0) { Write-Host '扫描不完整，异常文件总数可能更多。' }
-    Write-Host '不要立即覆盖其他备份副本，应先使用其他独立副本进行交叉验证。' -ForegroundColor Yellow
-    return
-}
-catch {
-    Write-Host "校验任务失败：$($_.Exception.GetBaseException().Message)" -ForegroundColor Red
-    Write-Host '不要立即覆盖其他备份副本，应先使用其他独立副本进行交叉验证。' -ForegroundColor Yellow
-    if ($stagingPath -and -not $published) {
-        Write-Host "如已生成中间报告，将保留在：$stagingPath"
-        Write-Host '该文件为未完成报告，不代表完整校验结果。'
+    catch {
+        Write-Host "校验任务失败：$($_.Exception.GetBaseException().Message)" -ForegroundColor Red
+        Write-Host '不要立即覆盖其他备份副本，应先使用其他独立副本进行交叉验证。' -ForegroundColor Yellow
+        if ($stagingPath -and -not $published) {
+            Write-Host "如已生成中间报告，将保留在：$stagingPath"
+            Write-Host '该文件为未完成报告，不代表完整校验结果。'
+        }
+        if (Test-ContinueRun '本轮失败。按回车继续校验下一份副本，输入 N 退出') {
+            $inputPath = ''
+            $inputManifest = ''
+            $inputReport = ''
+            continue
+        }
+        return
     }
-    return
-}
-finally {
-    if ($writer) { $writer.Dispose() }
-    if ($outputStream) { $outputStream.Dispose() }
-    if ($manifestStream) { $manifestStream.Dispose() }
-    Write-Progress -Id 1 -Activity '验证 SHA-256 基准' -Completed
+    finally {
+        if ($writer) { $writer.Dispose() }
+        if ($outputStream) { $outputStream.Dispose() }
+        if ($manifestStream) { $manifestStream.Dispose() }
+        Write-Progress -Id 1 -Activity '验证 SHA-256 基准' -Completed
+    }
 }

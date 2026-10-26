@@ -298,145 +298,174 @@ function Write-CsvRecord {
     $Writer.WriteLine($escaped -join ',')
 }
 
-$writer = $null
-$outputStream = $null
-$stagingPath = $null
-$published = $false
-$watch = [Diagnostics.Stopwatch]::StartNew()
-try {
-    if (-not $IsWindows) { throw '本脚本面向 Windows + PowerShell 7。' }
-    if ($Interactive) {
-        Write-Host 'Path：要建立基准的归档根目录；递归扫描其中所有普通文件。'
-        Write-Host 'Manifest：新建的 SHA-256 基准 CSV 完整路径；已存在时拒绝覆盖。'
-        Write-Host '路径不要加引号'
-        if ([string]::IsNullOrWhiteSpace($Path)) {
-            $Path = Read-Host '请输入 Path'
-        }
-    }
-    if ([string]::IsNullOrWhiteSpace($Path)) { throw '缺少 Path：请指定归档根目录。' }
-    $root = Get-ArchiveRoot $Path
-    Assert-ArchiveRootOutsideManagement $root
-    $defaultManifest = Get-DefaultManifestPath $root
-    if ([string]::IsNullOrWhiteSpace($Manifest)) {
-        if ($Interactive) {
-            $answer = Read-Host "请输入 Manifest（直接回车使用 $defaultManifest）"
-            $Manifest = if ([string]::IsNullOrWhiteSpace($answer)) { $defaultManifest } else { $answer }
-        }
-        else {
-            $Manifest = $defaultManifest
-        }
-    }
-    $manifestPath = Get-FullFileSystemPath $Manifest
-    # Manifest 指定到目录一级也合法：在该目录下按默认命名规则自动创建 CSV。
-    $isDirectoryTarget = $false
-    if ([IO.Directory]::Exists($manifestPath)) {
-        $isDirectoryTarget = $true
-    }
-    elseif (-not [IO.File]::Exists($manifestPath) -and [IO.Path]::GetExtension($manifestPath) -ine '.csv') {
-        $isDirectoryTarget = $true
-    }
-    if ($isDirectoryTarget) {
-        $manifestPath = [IO.Path]::Combine($manifestPath, (Get-ManifestFileName $root))
-    }
-    $manifestParent = [IO.Path]::GetDirectoryName($manifestPath)
-    if ($isDirectoryTarget -and -not [IO.Directory]::Exists($manifestParent)) {
-        $null = [IO.Directory]::CreateDirectory($manifestParent)
-    }
-    Assert-NewOutput $manifestPath $root
-    Write-Host "Manifest：$manifestPath"
-    if ($script:Comparer.Equals($root, $PSScriptRoot)) {
-        Write-Warning 'Path 是脚本目录：脚本、BAT、说明文件及其他普通文件也会进入基准；HASH 管理目录除外。'
-    }
-    Write-Host "归档根目录：$root"
-    Write-Host '请保持归档静止，暂停文件写入、同步和重命名。'
-    $inventory = Get-ArchiveInventory $root $manifestPath $null
-    $fileCount = $inventory.Files.Count
-    if ($fileCount -eq 0 -and $inventory.Issues.Count -eq 0) {
-        throw '归档目录为空，拒绝建立空基准，请检查路径。'
-    }
+function Test-ContinueRun {
+    param([string]$Prompt)
+    # 非交互调用只执行一轮；交互模式默认继续，输入 N（或 no/否）退出。
+    if (-not $Interactive) { return $false }
+    Write-Host ''
+    $answer = Read-Host $Prompt
+    # 输入流已结束（如重定向文件读完）时不再继续，避免反复空提示。
+    if ($null -eq $answer) { return $false }
+    return ($answer -notmatch '^\s*(?:n|no|否)\s*$')
+}
 
-    # 中间文件与最终清单位于同一目录；失败时保留 .incomplete，绝不作为正式基准。
-    $stagingPath = $manifestPath + '.' + [guid]::NewGuid().ToString('N') + '.incomplete'
-    $outputStream = [IO.FileStream]::new($stagingPath, [IO.FileMode]::CreateNew,
-        [IO.FileAccess]::Write, [IO.FileShare]::None)
-    $writer = [IO.StreamWriter]::new($outputStream, [Text.UTF8Encoding]::new($true), 65536, $true)
-    Write-CsvRecord $writer @('RelativePath', 'Size', 'SHA256', 'LastWriteTimeUtc')
-    [int]$successCount = 0
-    [int]$failureCount = 0
-    [int]$processed = 0
-    foreach ($relative in ($inventory.Files.Keys | Sort-Object)) {
-        $processed++
-        Write-Progress -Id 1 -Activity '建立 SHA-256 基准' -Status "$processed / $fileCount；$relative" -PercentComplete (100.0 * $processed / $fileCount)
-        try {
-            $item = $inventory.Files[$relative]
-            $result = Get-StreamingSHA256 $item.FullPath $relative
-            if ($result.Size -ne $item.Size -or
-                $result.LastWriteTimeUtc -ne $item.LastWriteTimeUtc.ToString('o', [Globalization.CultureInfo]::InvariantCulture)) {
-                throw "文件在扫描后发生变化：$relative"
+# 交互循环的每轮输入；第一轮沿用命令行参数，继续执行时由提示重新提供。
+[string]$inputPath = $Path
+[string]$inputManifest = $Manifest
+
+# 交互模式（双击 BAT）下循环执行；非交互调用执行一轮后结束。
+# 每轮重新初始化输出状态，避免上一轮的中间文件信息混入下一轮。
+while ($true) {
+    $writer = $null
+    $outputStream = $null
+    $stagingPath = $null
+    $published = $false
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        if (-not $IsWindows) { throw '本脚本面向 Windows + PowerShell 7。' }
+        if ($Interactive) {
+            Write-Host 'Path：要建立基准的归档根目录；递归扫描其中所有普通文件。'
+            Write-Host 'Manifest：新建的 SHA-256 基准 CSV 完整路径；已存在时拒绝覆盖。'
+            Write-Host '路径不要加引号'
+            if ([string]::IsNullOrWhiteSpace($inputPath)) {
+                $inputPath = Read-Host '请输入 Path'
             }
         }
-        catch {
-            $failureCount++
-            Write-Warning "计算失败 [$relative]：$($_.Exception.GetBaseException().Message)"
+        if ([string]::IsNullOrWhiteSpace($inputPath)) { throw '缺少 Path：请指定归档根目录。' }
+        $root = Get-ArchiveRoot $inputPath
+        Assert-ArchiveRootOutsideManagement $root
+        $defaultManifest = Get-DefaultManifestPath $root
+        if ([string]::IsNullOrWhiteSpace($inputManifest)) {
+            if ($Interactive) {
+                $answer = Read-Host "请输入 Manifest（直接回车使用 $defaultManifest）"
+                $inputManifest = if ([string]::IsNullOrWhiteSpace($answer)) { $defaultManifest } else { $answer }
+            }
+            else {
+                $inputManifest = $defaultManifest
+            }
+        }
+        $manifestPath = Get-FullFileSystemPath $inputManifest
+        # Manifest 指定到目录一级也合法：在该目录下按默认命名规则自动创建 CSV。
+        $isDirectoryTarget = $false
+        if ([IO.Directory]::Exists($manifestPath)) {
+            $isDirectoryTarget = $true
+        }
+        elseif (-not [IO.File]::Exists($manifestPath) -and [IO.Path]::GetExtension($manifestPath) -ine '.csv') {
+            $isDirectoryTarget = $true
+        }
+        if ($isDirectoryTarget) {
+            $manifestPath = [IO.Path]::Combine($manifestPath, (Get-ManifestFileName $root))
+        }
+        $manifestParent = [IO.Path]::GetDirectoryName($manifestPath)
+        if ($isDirectoryTarget -and -not [IO.Directory]::Exists($manifestParent)) {
+            $null = [IO.Directory]::CreateDirectory($manifestParent)
+        }
+        Assert-NewOutput $manifestPath $root
+        Write-Host "Manifest：$manifestPath"
+        if ($script:Comparer.Equals($root, $PSScriptRoot)) {
+            Write-Warning 'Path 是脚本目录：脚本、BAT、说明文件及其他普通文件也会进入基准；HASH 管理目录除外。'
+        }
+        Write-Host "归档根目录：$root"
+        Write-Host '请保持归档静止，暂停文件写入、同步和重命名。'
+        $inventory = Get-ArchiveInventory $root $manifestPath $null
+        $fileCount = $inventory.Files.Count
+        if ($fileCount -eq 0 -and $inventory.Issues.Count -eq 0) {
+            throw '归档目录为空，拒绝建立空基准，请检查路径。'
+        }
+
+        # 中间文件与最终清单位于同一目录；失败时保留 .incomplete，绝不作为正式基准。
+        $stagingPath = $manifestPath + '.' + [guid]::NewGuid().ToString('N') + '.incomplete'
+        $outputStream = [IO.FileStream]::new($stagingPath, [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $writer = [IO.StreamWriter]::new($outputStream, [Text.UTF8Encoding]::new($true), 65536, $true)
+        Write-CsvRecord $writer @('RelativePath', 'Size', 'SHA256', 'LastWriteTimeUtc')
+        [int]$successCount = 0
+        [int]$failureCount = 0
+        [int]$processed = 0
+        foreach ($relative in ($inventory.Files.Keys | Sort-Object)) {
+            $processed++
+            Write-Progress -Id 1 -Activity '建立 SHA-256 基准' -Status "$processed / $fileCount；$relative" -PercentComplete (100.0 * $processed / $fileCount)
+            try {
+                $item = $inventory.Files[$relative]
+                $result = Get-StreamingSHA256 $item.FullPath $relative
+                if ($result.Size -ne $item.Size -or
+                    $result.LastWriteTimeUtc -ne $item.LastWriteTimeUtc.ToString('o', [Globalization.CultureInfo]::InvariantCulture)) {
+                    throw "文件在扫描后发生变化：$relative"
+                }
+            }
+            catch {
+                $failureCount++
+                Write-Warning "计算失败 [$relative]：$($_.Exception.GetBaseException().Message)"
+                continue
+            }
+            # 输出失败是整个任务失败，不作为单个归档文件的读取错误处理。
+            Write-CsvRecord $writer @($relative, $result.Size, $result.SHA256, $result.LastWriteTimeUtc)
+            $successCount++
+        }
+        Write-Progress -Id 1 -Activity '建立 SHA-256 基准' -Completed
+
+        # 再扫描一次，检测运行期间增加、移除或修改的文件。
+        Write-Host '复查目录是否在运行期间变化……'
+        $afterScan = Get-ArchiveInventory $root $manifestPath $stagingPath
+        [int]$changeCount = 0
+        foreach ($relative in $inventory.Files.Keys) {
+            $oldItem = $inventory.Files[$relative]
+            if (-not $afterScan.Files.ContainsKey($relative) -or
+                $afterScan.Files[$relative].Size -ne $oldItem.Size -or
+                $afterScan.Files[$relative].LastWriteTimeUtc -ne $oldItem.LastWriteTimeUtc) {
+                $changeCount++
+                Write-Warning "目录复查发现变化或无法访问：$relative"
+            }
+        }
+        foreach ($relative in $afterScan.Files.Keys) {
+            if (-not $inventory.Files.ContainsKey($relative)) {
+                $changeCount++
+                Write-Warning "目录复查发现新增文件：$relative"
+            }
+        }
+        $scanErrors = $inventory.Issues.Count + $afterScan.Issues.Count
+        Write-Host ("文件总数（已扫描）：{0}；数据总大小：{1} 字节（{2:N3} GiB）" -f $fileCount, $inventory.TotalBytes, ($inventory.TotalBytes / 1GB))
+        Write-Host "成功计算：$successCount；计算失败：$failureCount；扫描错误事件：$scanErrors；复查变化：$changeCount"
+        Write-Host "排除的清单/报告：$($inventory.Skipped.Count)；总耗时：$($watch.Elapsed)"
+        $writer.Flush()
+        $outputStream.Flush($true)
+        $writer.Dispose()
+        $writer = $null
+        $outputStream.Dispose()
+        $outputStream = $null
+        if ($failureCount -gt 0 -or $scanErrors -gt 0 -or $changeCount -gt 0) {
+            throw '存在失败、扫描不完整或运行期间变化，未发布正式 Manifest。扫描不完整时文件总数/大小仅代表已发现部分。'
+        }
+        Assert-NewOutput $manifestPath $root
+        [IO.File]::Move($stagingPath, $manifestPath, $false)
+        $published = $true
+        Write-Host "基准清单已保存：$manifestPath" -ForegroundColor Green
+        Write-Host "总耗时：$($watch.Elapsed)"
+        Write-Host '请立即独立校验，并将这份基准清单备份到不同设备。'
+        # 交互模式默认继续；非交互调用或用户输入 N 时结束脚本。
+        if (Test-ContinueRun '按回车继续建立下一份基准，输入 N 退出') {
+            $inputPath = ''
+            $inputManifest = ''
             continue
         }
-        # 输出失败是整个任务失败，不作为单个归档文件的读取错误处理。
-        Write-CsvRecord $writer @($relative, $result.Size, $result.SHA256, $result.LastWriteTimeUtc)
-        $successCount++
+        return
     }
-    Write-Progress -Id 1 -Activity '建立 SHA-256 基准' -Completed
-
-    # 再扫描一次，检测运行期间增加、移除或修改的文件。
-    Write-Host '复查目录是否在运行期间变化……'
-    $afterScan = Get-ArchiveInventory $root $manifestPath $stagingPath
-    [int]$changeCount = 0
-    foreach ($relative in $inventory.Files.Keys) {
-        $oldItem = $inventory.Files[$relative]
-        if (-not $afterScan.Files.ContainsKey($relative) -or
-            $afterScan.Files[$relative].Size -ne $oldItem.Size -or
-            $afterScan.Files[$relative].LastWriteTimeUtc -ne $oldItem.LastWriteTimeUtc) {
-            $changeCount++
-            Write-Warning "目录复查发现变化或无法访问：$relative"
+    catch {
+        Write-Host "建立基准失败：$($_.Exception.GetBaseException().Message)" -ForegroundColor Red
+        if ($stagingPath -and -not $published) {
+            Write-Host "如已生成中间文件，将保留在：$stagingPath"
+            Write-Host '该 .incomplete 文件不可用于验证，也不要手动改名为正式清单。'
         }
-    }
-    foreach ($relative in $afterScan.Files.Keys) {
-        if (-not $inventory.Files.ContainsKey($relative)) {
-            $changeCount++
-            Write-Warning "目录复查发现新增文件：$relative"
+        if (Test-ContinueRun '本轮失败。按回车继续建立下一份基准，输入 N 退出') {
+            $inputPath = ''
+            $inputManifest = ''
+            continue
         }
+        return
     }
-    $scanErrors = $inventory.Issues.Count + $afterScan.Issues.Count
-    Write-Host ("文件总数（已扫描）：{0}；数据总大小：{1} 字节（{2:N3} GiB）" -f $fileCount, $inventory.TotalBytes, ($inventory.TotalBytes / 1GB))
-    Write-Host "成功计算：$successCount；计算失败：$failureCount；扫描错误事件：$scanErrors；复查变化：$changeCount"
-    Write-Host "排除的清单/报告：$($inventory.Skipped.Count)；总耗时：$($watch.Elapsed)"
-    $writer.Flush()
-    $outputStream.Flush($true)
-    $writer.Dispose()
-    $writer = $null
-    $outputStream.Dispose()
-    $outputStream = $null
-    if ($failureCount -gt 0 -or $scanErrors -gt 0 -or $changeCount -gt 0) {
-        throw '存在失败、扫描不完整或运行期间变化，未发布正式 Manifest。扫描不完整时文件总数/大小仅代表已发现部分。'
+    finally {
+        if ($writer) { $writer.Dispose() }
+        if ($outputStream) { $outputStream.Dispose() }
+        Write-Progress -Id 1 -Activity '建立 SHA-256 基准' -Completed
     }
-    Assert-NewOutput $manifestPath $root
-    [IO.File]::Move($stagingPath, $manifestPath, $false)
-    $published = $true
-    Write-Host "基准清单已保存：$manifestPath" -ForegroundColor Green
-    Write-Host "总耗时：$($watch.Elapsed)"
-    Write-Host '请立即独立校验，并将这份基准清单备份到不同设备。'
-    # 用 return 结束脚本而非 exit，运行后回到交互式提示符，不关闭宿主会话。
-    return
-}
-catch {
-    Write-Host "建立基准失败：$($_.Exception.GetBaseException().Message)" -ForegroundColor Red
-    if ($stagingPath -and -not $published) {
-        Write-Host "如已生成中间文件，将保留在：$stagingPath"
-        Write-Host '该 .incomplete 文件不可用于验证，也不要手动改名为正式清单。'
-    }
-    return
-}
-finally {
-    if ($writer) { $writer.Dispose() }
-    if ($outputStream) { $outputStream.Dispose() }
-    Write-Progress -Id 1 -Activity '建立 SHA-256 基准' -Completed
 }
