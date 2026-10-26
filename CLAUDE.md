@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - `Create-HashManifest.ps1`：首次扫描归档根目录，为每个普通文件计算 SHA-256，生成基准 CSV（Manifest）。
 - `Verify-HashManifest.ps1`：只读打开原始基准，重新计算当前副本的 SHA-256，生成差异报告 CSV。
-- `Create-HashManifest.bat` / `Verify-HashManifest.bat`：双击交互运行，结束时 `pause` 显示退出码。
+- `Create-HashManifest.bat` / `Verify-HashManifest.bat`：双击交互运行；带 `-Interactive` 时每轮结束后直接回车继续、输入 N 退出，可循环处理多个目录，退出循环后 `pause` 显示退出码。
 
 详细设计、参数表、异常状态表、退出码表都在 `README.md` 中，修改行为前先读它。
 

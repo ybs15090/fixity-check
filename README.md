@@ -39,7 +39,7 @@
 | Verify | -Path | CLI 必填；双击时输入 | 被验证副本的归档根目录 |
 | Verify | -Manifest | 否 | 最初基准 CSV；省略时自动在归档根父目录查找；只读 |
 | Verify | -Report | 否 | 新报告 CSV；省略时自动在清单目录命名 |
-| 两者 | -Interactive | 否 | 显示参数含义并在缺少输入时提示；BAT 自动指定 |
+| 两者 | -Interactive | 否 | 显示参数含义并在缺少输入时提示；每轮结束后直接回车继续、输入 N 退出；BAT 自动指定 |
 
 省略 -Manifest 时，Create 默认命名为“<归档根目录名>_SHA256_<创建日期 yyyyMMdd>.csv”，保存到归档根目录的父目录（与归档根并列）。例如 -Path 为 D:\Archive\Data，则默认 D:\Archive\Data_SHA256_20261026.csv。Create 的 -Manifest 也可指向目录：在该目录下按默认命名自动创建 CSV（目录不存在会自动创建）。Verify 省略 -Manifest 时，自动在归档根父目录查找“<归档根目录名>_SHA256_*.csv”，多个匹配取最新。原基准若是自定义名称，必须明确输入原路径。自定义文件路径的父目录需预先存在。支持盘符和普通 UNC 路径；拒绝设备路径前缀。脚本不删除文件，也不修改系统配置。
 
@@ -47,7 +47,7 @@
 
 在 PowerShell 7 中从本目录执行；非交互调用可使用 pwsh.exe -NoProfile -NonInteractive -File。
 
-双击本目录的 Create-HashManifest.bat 或 Verify-HashManifest.bat，会显示 Path、Manifest、Report 的含义并等待输入。Create 的 Manifest 直接回车使用默认命名；Verify 的 Manifest 直接回车自动查找、Report 留空自动命名。查看屏幕上的绿色/红色结果文字后按任意键关闭窗口。双击交互调用不会使用 -NonInteractive；无人值守命令仍应使用它。
+双击本目录的 Create-HashManifest.bat 或 Verify-HashManifest.bat，会显示 Path、Manifest、Report 的含义并等待输入。Create 的 Manifest 直接回车使用默认命名；Verify 的 Manifest 直接回车自动查找、Report 留空自动命名。每轮执行结束后会提示“按回车继续……，输入 N 退出”：直接回车继续并重新输入下一轮的 Path、Manifest、Report；输入 N（或 no/否）退出循环。查看屏幕上的绿色/红色结果文字后按任意键关闭窗口。双击交互调用不会使用 -NonInteractive；无人值守命令仍应使用它，且只执行一轮。
 
 建立基准（省略 -Manifest 时按默认规则命名，结果看输出文字）：
 
@@ -145,7 +145,7 @@ LastWriteTimeUtc 仅供人工排查，不能独立构成内容损坏结论。NEW
 
 ## 11. 运行结果判断
 
-脚本运行结束后回到初始提示符，不再通过 exit 返回退出码（因此双击 BAT 时 %ERRORLEVEL% 恒为 0，自动化不应依赖退出码）。请根据屏幕输出判断结果：
+脚本运行结束后回到初始提示符，不再通过 exit 返回退出码（因此双击 BAT 时 %ERRORLEVEL% 恒为 0，自动化不应依赖退出码）。交互模式每轮结束（成功或失败）后都会提示继续；直接回车重新执行，输入 N 退出循环。非交互调用只执行一轮。请根据屏幕输出判断结果：
 
 - 绿色文字「基准清单已保存」「完整性校验通过」= 成功/通过。
 - 红色文字「建立基准失败」「完整性校验未通过」「校验任务失败」= 失败/未通过。
@@ -180,6 +180,7 @@ LastWriteTimeUtc 仅供人工排查，不能独立构成内容损坏结论。NEW
 - 1,202 个文件的批量创建/校验、364 字符长路径、16 MiB 流式哈希与独立 SHA-256 对比；
 - 非法相对路径、绝对路径、重复条目、无效哈希和无效大小均被拒绝；基准与报告禁止覆盖，验证后原始基准的 SHA-256 和修改时间未变化；
 - 双击 BAT 的交互输入、默认命名清单、结果文字暂停窗口；归档根包含脚本目录时管理 HASH 被排除；再次 Create 拒绝覆盖；
+- 交互模式连续两轮对两个不同归档执行 Create/Verify（直接回车继续，输入 N 退出），失败后回车也能进入下一轮；非交互调用只执行一轮；
 - PowerShell 语法解析无错误。
 
 未在真实 NAS/SMB、数 TB 数据或断电场景中测试。正式运行前先在自己的存储上做小样本演练，并核对数量、排除列表、报告和结果文字。
