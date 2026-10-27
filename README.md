@@ -38,7 +38,7 @@
 | Create | -Manifest | 否 | 新基准 CSV；省略时按默认规则命名并存到归档根父目录，也可指向目录或完整文件路径；已存在则拒绝覆盖 |
 | Verify | -Path | CLI 必填；双击时输入 | 被验证副本的归档根目录 |
 | Verify | -Manifest | 否 | 最初基准 CSV；省略时自动在归档根父目录查找；只读 |
-| Verify | -Report | 否 | 新报告 CSV；省略时自动在清单目录命名 |
+| Verify | -Report | 否 | 新报告 CSV；省略时自动在清单目录命名，格式为“<被校验目录名>_Verification_<时间戳>_<随机串>.csv” |
 | 两者 | -Interactive | 否 | 显示参数含义并在缺少输入时提示；每轮结束后直接回车继续、输入 N 退出；BAT 自动指定 |
 
 省略 -Manifest 时，Create 默认命名为“<归档根目录名>_SHA256_<创建日期 yyyyMMdd>.csv”，保存到归档根目录的父目录（与归档根并列）。例如 -Path 为 D:\Archive\Data，则默认 D:\Archive\Data_SHA256_20261026.csv。Create 的 -Manifest 也可指向目录：在该目录下按默认命名自动创建 CSV（目录不存在会自动创建）。Verify 省略 -Manifest 时，自动在归档根父目录查找“<归档根目录名>_SHA256_*.csv”，多个匹配取最新。原基准若是自定义名称，必须明确输入原路径。自定义文件路径的父目录需预先存在。支持盘符和普通 UNC 路径；拒绝设备路径前缀。脚本不删除文件，也不修改系统配置。

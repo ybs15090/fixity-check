@@ -446,7 +446,8 @@ while ($true) {
             $reportPath = Get-FullFileSystemPath $inputReport
         }
         else {
-            $name = 'Verification_{0}_{1}.csv' -f (Get-Date -Format 'yyyy-MM-dd_HHmmss_fff'), ([guid]::NewGuid().ToString('N').Substring(0, 8))
+            # 前缀用被校验目录名，使报告在资源管理器中按名称排序时与归档目录相邻。
+            $name = '{0}_Verification_{1}_{2}.csv' -f (Get-ArchiveDisplayName $root), (Get-Date -Format 'yyyy-MM-dd_HHmmss_fff'), ([guid]::NewGuid().ToString('N').Substring(0, 8))
             $reportPath = [IO.Path]::Combine([IO.Path]::GetDirectoryName($manifestPath), $name)
         }
         if ($script:Comparer.Equals($reportPath, $manifestPath)) { throw '报告路径不能与原始 Manifest 相同。' }
